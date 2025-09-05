@@ -1,0 +1,9 @@
+flask
+faiss-cpu
+sentence-transformers
+pypdf2
+python-docx
+transformers
+torch
+google-genai
+
