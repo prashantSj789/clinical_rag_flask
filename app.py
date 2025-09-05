@@ -12,7 +12,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Initialize Gemini client (will pick up from GEMINI_API_KEY env var)
 key = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key="AIzaSyDAmZTbNYwq6QA2-luBg0SeuYE7Rb8D6wI")
+client = genai.Client(api_key=key)
 
 MODEL_NAME = "gemini-2.5-flash"  # or "gemini-2.5-pro" if available to you
 
