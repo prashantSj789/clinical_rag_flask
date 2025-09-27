@@ -1,10 +1,11 @@
+from io import BytesIO
 import os
 from flask import Flask, request, jsonify
 from PyPDF2 import PdfReader
 import docx
 from flask.cli import load_dotenv
 from google import genai
-from vector_store import add_to_index, search_index
+from vector_store_to_chroma import add_to_index, search_index
 
 app = Flask(__name__)
 
@@ -16,7 +17,7 @@ load_dotenv()
 key = os.getenv("GEMINI_API_KEY",)
 client = genai.Client(api_key=key)
 # model name as a string when invoking generate_content
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "models/gemini-2.5-flash"
 
 def extract_text(file_path):
     """Extract raw text from PDF, DOCX, or TXT"""
@@ -52,10 +53,10 @@ def upload_doc():
 
     file = request.files["file"]
     doc_id = file.filename
-    file_path = os.path.join(UPLOAD_FOLDER, doc_id)
-    file.save(file_path)
 
-    text = extract_text(file_path)
+
+    file_stream = BytesIO(file.read())
+    text = extract_text(file_stream)  
     chunks = chunk_text(text)
 
     if not chunks:
