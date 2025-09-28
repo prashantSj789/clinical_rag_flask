@@ -6,4 +6,5 @@ python-docx
 transformers
 torch
 google-genai
-
+chromadb
+python-dotenv

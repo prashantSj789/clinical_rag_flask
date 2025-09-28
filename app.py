@@ -46,6 +46,14 @@ def chunk_text(text, chunk_size=2000, overlap=200):
         chunks.append(chunk)
     return chunks
 
+
+
+
+
+
+
+
+
 @app.route("/upload", methods=["POST"])
 def upload_doc():
     if "file" not in request.files:
