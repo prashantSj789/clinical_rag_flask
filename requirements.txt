@@ -8,3 +8,4 @@ torch
 google-genai
 chromadb
 python-dotenv
+redis
