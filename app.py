@@ -9,6 +9,7 @@ from flask.cli import load_dotenv
 import redis 
 from google import genai
 from vector_store_to_chroma import add_to_index, search_index
+from Bio import Entrez
 
 app = Flask(__name__)
 
@@ -26,6 +27,8 @@ REDIS_URL = "redis://localhost:6379/0"
 
 rdb = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
+Entrez.email = os.getenv("ENTREZ_EMAIL")  
+Entrez.api_key = os.getenv("ENTREZ_API_KEY")
 
 def extract_text(file_path):
     """Extract raw text from PDF, DOCX, or TXT"""
@@ -53,6 +56,59 @@ def chunk_text(text, chunk_size=2000, overlap=200):
         chunk = " ".join(words[i:i+chunk_size])
         chunks.append(chunk)
     return chunks
+
+def pubmed_search(query, max_results=3):
+    """
+    Search PubMed for the query, return summary or abstract snippets.
+    """
+    try:
+        # Search for article IDs
+        handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results)
+        search_data = Entrez.read(handle)
+        handle.close()
+
+        id_list = search_data.get("IdList", [])
+        if not id_list:
+            return None
+
+        # Fetch article summaries / abstracts
+        handle2 = Entrez.efetch(db="pubmed", id=",".join(id_list), retmode="xml")
+        fetch_data = Entrez.read(handle2)
+        handle2.close()
+
+        results = []
+        for article in fetch_data.get("PubmedArticle", []):
+            # Extract title, abstract
+            try:
+                title = article["MedlineCitation"]["Article"]["ArticleTitle"]
+            except:
+                title = ""
+            abstract = ""
+            try:
+                abstracts = article["MedlineCitation"]["Article"]["Abstract"]["AbstractText"]
+                if isinstance(abstracts, list):
+                    abstract = " ".join(abstracts)
+                else:
+                    abstract = str(abstracts)
+            except:
+                abstract = ""
+            snippet = f"Title: {title}\nAbstract: {abstract[:500]}..."
+            results.append(snippet)
+        return "\n\n".join(results)
+    except Exception as e:
+        print("PubMed search error:", e)
+        return None
+
+
+
+
+
+
+
+
+
+
+
 
 
 @app.route("/createsession", methods=["GET"])
@@ -93,46 +149,73 @@ def upload_doc():
 @app.route("/query", methods=["POST"])
 def query_doc():
     data = request.get_json()
-    question = data.get("question", "")
+    question = data.get("question", "").strip()
     session_id = data.get("session_id")
+    if not session_id or not question:
+        return jsonify({"error": "session_id & question needed"}), 400
 
-    if not session_id:
-        return jsonify({"error": "Session ID required"}), 400
-    if not question.strip():
-        return jsonify({"error": "Question required"}), 400
-
-    # Fetch previous chat history
     history = get_history(session_id)
-
-    # Search RAG context
+    # RAG retrieval
     results = search_index(question, top_k=3)
-    if not results:
-        return jsonify({"answer": "No documents found. Please upload guidelines first."})
+    context_chunks = [chunk for _, chunk in results]
+    context_text = "\n\n".join(context_chunks) if context_chunks else ""
 
-    context = "\n\n".join([chunk for _, chunk in results])
-
-    # Build prompt with history
+    # Build initial prompt, asking LLM whether to use web tool
     history_text = "\n".join(
         [f"User: {h['user']}\nAssistant: {h['assistant']}" for h in history]
     )
 
-    prompt = (
-        "You are a clinical assistant. "
-        "Answer based on clinical guidelines and prior conversation. "
-        "If unsure, say you don't know.\n\n"
-        f"Conversation so far:\n{history_text}\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\nAnswer:"
-    )
+    prompt1 = f"""
+You are a clinical assistant.  
+You have access to 2 sources of information:
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt
-    )
+1. CONTEXT (from clinical guidelines documents)  
+2. A trusted PubMed search tool
 
-    answer = response.text
+If the needed answer is fully covered in the CONTEXT, answer using only CONTEXT.
+If CONTEXT is missing or insufficient, respond exactly with the text "NEED_PUBMED".  
+Do not hallucinate or guess.  
 
-    # Update history
+History:
+{history_text}
+
+CONTEXT:
+{context_text or '[none]'}
+
+QUESTION:
+{question}
+
+If you decide the context is insufficient, reply "NEED_PUBMED". Otherwise answer.
+"""
+
+    resp1 = client.models.generate_content(model=MODEL_NAME, contents=prompt1)
+    text1 = resp1.text.strip()
+
+    if text1 == "NEED_PUBMED":
+        # Use PubMed tool
+        pubmed_info = pubmed_search(question, max_results=3)
+        if not pubmed_info:
+            answer = "I could not find relevant results in PubMed either. I'm sorry, I don't know."
+        else:
+            prompt2 = f"""
+You are a clinical assistant. Use the following PubMed search results to answer the question fully and accurately.  
+Be cautious and mention if information is uncertain.
+
+PubMed Results:
+{pubmed_info}
+
+QUESTION:
+{question}
+
+Answer:
+"""
+            resp2 = client.models.generate_content(model=MODEL_NAME, contents=prompt2)
+            answer = resp2.text.strip()
+    else:
+        # LLM used context already
+        answer = text1
+
+    # Save to history
     history.append({"user": question, "assistant": answer})
     save_history(session_id, history)
 
