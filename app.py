@@ -7,9 +7,12 @@ from PyPDF2 import PdfReader
 import docx
 from flask.cli import load_dotenv
 import redis 
-from google import genai
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph,END,START
+
 from vector_store_to_chroma import add_to_index, search_index
 from Bio import Entrez
+from typing_extensions import TypedDict
 
 app = Flask(__name__)
 
@@ -19,7 +22,8 @@ load_dotenv()
 
 # Initialize Gemini client (from env or fallback)
 key = os.getenv("GEMINI_API_KEY",)
-client = genai.Client(api_key=key)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=key)
+
 # model name as a string when invoking generate_content
 MODEL_NAME = "models/gemini-2.5-flash"
 
@@ -29,6 +33,95 @@ rdb = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 Entrez.email = os.getenv("ENTREZ_EMAIL")  
 Entrez.api_key = os.getenv("ENTREZ_API_KEY")
+
+class RAGstate(TypedDict):
+    question: str
+    context: str
+    pubmed_results: str
+    answer: str
+    history: str
+
+def retrival_node(state: RAGstate) -> RAGstate:
+    results = search_index(state["question"], top_k=3)
+    context = "\n\n".join([chunk for _, chunk in results]) if results else ""
+    return {"context": context}
+
+def decision_node(state: RAGstate) -> RAGstate:
+    prompt = f"""
+You are a clinical assistant.
+
+Conversation so far:
+{state['history'] or '[none]'}
+
+Retrieved CONTEXT:
+{state['context'] or '[none]'}
+
+QUESTION:
+{state['question']}
+
+If the context is sufficient, answer directly.
+If insufficient, output exactly "NEED_PUBMED".
+"""
+    resp = llm.invoke(prompt) 
+    text = resp.content.strip()
+    if text == "NEED_PUBMED":
+        return {"pubmed_results": "NEED"}
+    return {"answer": text}
+
+    
+
+def pubmed_node(state: RAGstate) -> RAGstate:
+    if state.get("pubmed_results") != "NEED":
+        return {}
+    results = pubmed_search(state["question"], max_results=3)
+    return {"pubmed_results": results or ""}   
+
+
+def answer_node(state: RAGstate) -> RAGstate:
+    if state.get("answer"):
+        return {}
+    prompt = f"""
+You are a clinical assistant. Use the following PubMed search results to answer the question fully and accurately.  
+Be cautious and mention if information is uncertain.
+
+Conversation so far:
+{state['history'] or '[none]'}
+
+PubMed Results:
+{state['pubmed_results'] or '[none]'}
+QUESTION:
+{state['question']}
+
+Answer:
+"""
+    resp = llm.invoke(prompt) 
+    text = resp.text.strip()
+    return {"answer": text}         
+
+
+graph = StateGraph(RAGstate)
+
+graph.add_node("retrieval", retrival_node)
+graph.add_node("decider", decision_node)
+graph.add_node("pubmed", pubmed_node)
+graph.add_node("answer", answer_node)
+
+# flow
+graph.add_edge(START, "retrieval")
+graph.add_edge("retrieval", "decider")
+
+# conditional branch
+graph.add_conditional_edges(
+    "decider",
+    lambda state: "pubmed" if state.get("pubmed_results") == "NEED" else "answer",
+    {"pubmed": "pubmed", "answer": "answer"}
+)
+
+graph.add_edge("pubmed", "answer")
+graph.add_edge("answer", END)
+
+
+rag_app = graph.compile()
 
 def extract_text(file_path):
     """Extract raw text from PDF, DOCX, or TXT"""
@@ -154,76 +247,29 @@ def query_doc():
     if not session_id or not question:
         return jsonify({"error": "session_id & question needed"}), 400
 
+    # load history from Redis
     history = get_history(session_id)
-    # RAG retrieval
-    results = search_index(question, top_k=3)
-    context_chunks = [chunk for _, chunk in results]
-    context_text = "\n\n".join(context_chunks) if context_chunks else ""
-
-    # Build initial prompt, asking LLM whether to use web tool
     history_text = "\n".join(
         [f"User: {h['user']}\nAssistant: {h['assistant']}" for h in history]
     )
 
-    prompt1 = f"""
-You are a clinical assistant.  
-You have access to 2 sources of information:
+    # run graph with history-aware state
+    state = rag_app.invoke({
+        "question": question,
+        "context": "",
+        "pubmed_results": "",
+        "answer": "",
+        "history": history_text
+    })
+    answer = state["answer"]
 
-1. CONTEXT (from clinical guidelines documents)  
-2. A trusted PubMed search tool
-
-If the needed answer is fully covered in the CONTEXT, answer using only CONTEXT.
-If CONTEXT is missing or insufficient, respond exactly with the text "NEED_PUBMED".  
-Do not hallucinate or guess.  
-
-History:
-{history_text}
-
-CONTEXT:
-{context_text or '[none]'}
-
-QUESTION:
-{question}
-
-If you decide the context is insufficient, reply "NEED_PUBMED". Otherwise answer.
-"""
-
-    resp1 = client.models.generate_content(model=MODEL_NAME, contents=prompt1)
-    text1 = resp1.text.strip()
-
-    if text1 == "NEED_PUBMED":
-        # Use PubMed tool
-        pubmed_info = pubmed_search(question, max_results=3)
-        if not pubmed_info:
-            answer = "I could not find relevant results in PubMed either. I'm sorry, I don't know."
-        else:
-            prompt2 = f"""
-You are a clinical assistant. Use the following PubMed search results to answer the question fully and accurately.  
-Be cautious and mention if information is uncertain.
-
-PubMed Results:
-{pubmed_info}
-
-QUESTION:
-{question}
-
-Answer:
-"""
-            resp2 = client.models.generate_content(model=MODEL_NAME, contents=prompt2)
-            answer = resp2.text.strip()
-    else:
-        # LLM used context already
-        answer = text1
-
-    # Save to history
+    # save updated history
     history.append({"user": question, "assistant": answer})
     save_history(session_id, history)
 
     return jsonify({
         "answer": answer,
-        "sources": [doc for doc, _ in results],
         "history_length": len(history)
     })
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=True)
