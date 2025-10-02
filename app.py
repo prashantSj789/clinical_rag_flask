@@ -10,7 +10,7 @@ import redis
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph,END,START
 
-from vector_store_to_chroma import add_to_index, search_index
+from vector_store_to_chroma import add_project_docs, add_to_index, search_index
 from Bio import Entrez
 from typing_extensions import TypedDict
 
@@ -38,6 +38,7 @@ class RAGstate(TypedDict):
     question: str
     context: str
     pubmed_results: str
+    aboutquery: str
     answer: str
     history: str
 
@@ -61,6 +62,7 @@ QUESTION:
 
 If the context is sufficient, answer directly.
 If insufficient, output exactly "NEED_PUBMED".
+
 """
     resp = llm.invoke(prompt) 
     text = resp.content.strip()
@@ -232,16 +234,64 @@ def upload_doc():
     file = request.files["file"]
     doc_id = file.filename
 
+    # Save temporarily
+    file_path = os.path.join(UPLOAD_FOLDER, doc_id)
+    file.save(file_path)
 
-    file_stream = BytesIO(file.read())
-    text = extract_text(file_stream)  
+    try:
+        text = extract_text(file_path)
+    finally:
+        # Always remove the temp file
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
     chunks = chunk_text(text)
-
     if not chunks:
         return jsonify({"error": "No text extracted from document"}), 400
 
     add_to_index(chunks, doc_id)
-    return jsonify({"message": "Document indexed successfully", "doc_id": doc_id, "chunks": len(chunks)})
+    return jsonify({
+        "message": "Document indexed successfully",
+        "doc_id": doc_id,
+        "chunks": len(chunks)
+    })
+
+
+@app.route("/upload_docs", methods=["POST"])
+def upload_app_doc():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files["file"]
+    doc_id = file.filename
+
+    # Save temporarily
+    file_path = os.path.join(UPLOAD_FOLDER, doc_id)
+    file.save(file_path)
+
+    try:
+        text = extract_text(file_path)
+    finally:
+        # Always remove the temp file
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    chunks = chunk_text(text)
+    if not chunks:
+        return jsonify({"error": "No text extracted from document"}), 400
+
+    add_project_docs(chunks, doc_id)
+    return jsonify({
+        "message": "App document indexed successfully",
+        "doc_id": doc_id,
+        "chunks": len(chunks)
+    })
+
+ 
+
+
+
+
 
 @app.route("/query", methods=["POST"])
 def query_doc():
