@@ -80,22 +80,26 @@ def pubmed_node(state: RAGstate) -> RAGstate:
 def answer_node(state: RAGstate) -> RAGstate:
     if state.get("answer"):
         return {}
+
     prompt = f"""
-You are a clinical assistant. Use the following PubMed search results to answer the question fully and accurately.  
-Be cautious and mention if information is uncertain.
+You are a clinical assistant. 
+IMPORTANT RULES:
+- ONLY use the provided context to answer.
+- If the context does not contain enough information, respond with exactly: "I don't know based on the available context."
+- Do NOT use your own general knowledge.
+- Do NOT invent answers.
 
 Conversation so far:
 {state['history'] or '[none]'}
 
-PubMed Results:
-{state['pubmed_results'] or '[none]'}
-QUESTION:
-{state['question']}
+Context:
+{state['context'] or '[none]'}
 
-Answer:
+Question:
+{state['question']}
 """
     resp = llm.invoke(prompt) 
-    text = resp.text.strip()
+    text = resp.content.strip()
     return {"answer": text}         
 
 
