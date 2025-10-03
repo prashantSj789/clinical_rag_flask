@@ -2,15 +2,17 @@ from io import BytesIO
 import json
 import os
 import uuid
+from celery import Celery
 from flask import Flask, request, jsonify
 from PyPDF2 import PdfReader
+
 import docx
 from flask.cli import load_dotenv
 import redis 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph,END,START
 
-from vector_store_to_chroma import add_project_docs, add_to_index, search_index
+from vector_store_to_chroma import add_project_docs, add_to_index, search_index, search_project_docs
 from Bio import Entrez
 from typing_extensions import TypedDict
 
@@ -31,6 +33,13 @@ REDIS_URL = "redis://localhost:6379/0"
 
 rdb = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
+
+celery = Celery(
+    "tasks",
+    broker="pyamqp://guest@localhost//",
+    backend="redis://localhost:6379/0"
+)
+
 Entrez.email = os.getenv("ENTREZ_EMAIL")  
 Entrez.api_key = os.getenv("ENTREZ_API_KEY")
 
@@ -42,14 +51,42 @@ class RAGstate(TypedDict):
     answer: str
     history: str
 
+
+@celery.task(name="run_query_task")
+def run_query_task(job_id, question, history_text, session_id):
+    state = rag_app.invoke({
+        "question": question,
+        "context": "",
+        "pubmed_results": "",
+        "answer": "",
+        "history": history_text
+    })
+    answer = state["answer"]
+
+    # Save in Redis & update history
+    data = rdb.get(session_id)
+    history = json.loads(data).get("history", []) if data else []
+    history.append({"user": question, "assistant": answer})
+    rdb.set(session_id, json.dumps({"history": history}))
+
+    return answer
+
 def retrival_node(state: RAGstate) -> RAGstate:
     results = search_index(state["question"], top_k=3)
     context = "\n\n".join([chunk for _, chunk in results]) if results else ""
     return {"context": context}
 
+def retrival_node2(state: RAGstate) -> RAGstate:
+    results = search_project_docs(state["question"], top_k=3)
+    context = "\n\n".join([chunk for _, chunk in results]) if results else ""
+    return {"context": context}
+
 def decision_node(state: RAGstate) -> RAGstate:
     prompt = f"""
-You are a clinical assistant.
+You are an assistant with access to two knowledge sources:
+
+1. **Clinical Guidelines Context** → for medical and clinical queries.  
+2. **App & Developer Context** → for questions about this project, its features, or the developer (resume, contact, skills).  
 
 Conversation so far:
 {state['history'] or '[none]'}
@@ -60,15 +97,22 @@ Retrieved CONTEXT:
 QUESTION:
 {state['question']}
 
-If the context is sufficient, answer directly.
-If insufficient, output exactly "NEED_PUBMED".
-
+INSTRUCTIONS:
+- If the retrieved CONTEXT contains enough information to answer, use ONLY that context to answer.  
+- If the question is **clinical** but the CONTEXT is insufficient, reply exactly with: "NEED_PUBMED".  
+- If the question is about the **app or developer** but the CONTEXT is insufficient, reply exactly with: "AboutQuery".  
+- Do NOT use your own general knowledge. Do NOT hallucinate.
 """
-    resp = llm.invoke(prompt) 
-    text = resp.content.strip()
+    resp = llm.invoke(prompt)
+    text = resp.strip() if isinstance(resp, str) else getattr(resp, "content", "").strip()
+
     if text == "NEED_PUBMED":
         return {"pubmed_results": "NEED"}
-    return {"answer": text}
+    elif text == "AboutQuery":
+        return {"aboutquery": "NEED"}
+    else:
+        return {"answer": text}
+
 
     
 
@@ -77,6 +121,14 @@ def pubmed_node(state: RAGstate) -> RAGstate:
         return {}
     results = pubmed_search(state["question"], max_results=3)
     return {"pubmed_results": results or ""}   
+
+def doc_node(state: RAGstate) -> RAGstate:
+    if state.get("aboutquery") != "NEED":
+        return {}
+    results = retrival_node2(state)
+    return {"context": results.get("context","")}
+
+
 
 
 def answer_node(state: RAGstate) -> RAGstate:
@@ -88,6 +140,7 @@ You are a clinical assistant.
 IMPORTANT RULES:
 - ONLY use the provided context to answer.
 - If the context does not contain enough information, respond with exactly: "I don't know based on the available context."
+- If you do not have enough information to answer from the context you may reffer to the PubMed results if given below if availale.
 - Do NOT use your own general knowledge.
 - Do NOT invent answers.
 
@@ -96,6 +149,9 @@ Conversation so far:
 
 Context:
 {state['context'] or '[none]'}
+
+PubMed Results:
+{state['pubmed_results'] or '[none]'}
 
 Question:
 {state['question']}
@@ -111,21 +167,29 @@ graph.add_node("retrieval", retrival_node)
 graph.add_node("decider", decision_node)
 graph.add_node("pubmed", pubmed_node)
 graph.add_node("answer", answer_node)
-
+graph.add_node("docretrieval", doc_node)
 # flow
 graph.add_edge(START, "retrieval")
 graph.add_edge("retrieval", "decider")
 
+def decider_branch(state):
+    if state.get("pubmed_results") == "NEED":
+        return "pubmed"
+    elif state.get("aboutquery") == "NEED":
+        return "docretrieval"
+    else:
+        return "answer"
+
 # conditional branch
 graph.add_conditional_edges(
     "decider",
-    lambda state: "pubmed" if state.get("pubmed_results") == "NEED" else "answer",
-    {"pubmed": "pubmed", "answer": "answer"}
+    decider_branch,
+    {"pubmed": "pubmed", "docretrieval": "docretrieval", "answer": "answer"}
 )
 
 graph.add_edge("pubmed", "answer")
+graph.add_edge("docretrieval", "answer")
 graph.add_edge("answer", END)
-
 
 rag_app = graph.compile()
 
@@ -199,6 +263,14 @@ def pubmed_search(query, max_results=3):
         return None
 
 
+def get_history(session_id):
+    data = rdb.get(session_id)
+    if not data:
+        return []
+    return json.loads(data).get("history", [])
+
+def save_history(session_id, history):
+    rdb.set(session_id, json.dumps({"history": history}))
 
 
 
@@ -207,6 +279,7 @@ def pubmed_search(query, max_results=3):
 
 
 
+ 
 
 
 
@@ -216,15 +289,8 @@ def create_session():
     rdb.set(session_id, json.dumps({"history": []}))
     return jsonify({"session_id": session_id})
 
-def get_history(session_id):
-    data = rdb.get(session_id)
-    if not data:
-        return []
-    return json.loads(data).get("history", [])
 
 
-def save_history(session_id, history):
-    rdb.set(session_id, json.dumps({"history": history}))
 
 @app.route("/upload", methods=["POST"])
 def upload_doc():
@@ -290,9 +356,6 @@ def upload_app_doc():
  
 
 
-
-
-
 @app.route("/query", methods=["POST"])
 def query_doc():
     data = request.get_json()
@@ -301,29 +364,16 @@ def query_doc():
     if not session_id or not question:
         return jsonify({"error": "session_id & question needed"}), 400
 
-    # load history from Redis
     history = get_history(session_id)
-    history_text = "\n".join(
-        [f"User: {h['user']}\nAssistant: {h['assistant']}" for h in history]
-    )
+    history_text = "\n".join([f"User: {h['user']}\nAssistant: {h['assistant']}" for h in history])
 
-    # run graph with history-aware state
-    state = rag_app.invoke({
-        "question": question,
-        "context": "",
-        "pubmed_results": "",
-        "answer": "",
-        "history": history_text
-    })
-    answer = state["answer"]
+    job_id = str(uuid.uuid4())
+    task = run_query_task.delay(job_id, question, history_text, session_id)
+    answer = task.get(timeout=60)
 
-    # save updated history
-    history.append({"user": question, "assistant": answer})
-    save_history(session_id, history)
+    history = get_history(session_id)
+    return jsonify({"answer": answer, "history_length": len(history)})
 
-    return jsonify({
-        "answer": answer,
-        "history_length": len(history)
-    })
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=True)
