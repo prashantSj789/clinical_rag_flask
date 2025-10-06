@@ -34,12 +34,6 @@ REDIS_URL = "redis://localhost:6379/0"
 rdb = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
-celery = Celery(
-    "tasks",
-    broker="pyamqp://guest@localhost//",
-    backend="redis://localhost:6379/0"
-)
-
 Entrez.email = os.getenv("ENTREZ_EMAIL")  
 Entrez.api_key = os.getenv("ENTREZ_API_KEY")
 
@@ -52,8 +46,7 @@ class RAGstate(TypedDict):
     history: str
 
 
-@celery.task(name="run_query_task")
-def run_query_task(job_id, question, history_text, session_id):
+def run_query_task(question, history_text, session_id):
     state = rag_app.invoke({
         "question": question,
         "context": "",
@@ -64,12 +57,12 @@ def run_query_task(job_id, question, history_text, session_id):
     answer = state["answer"]
 
     # Save in Redis & update history
-    data = rdb.get(session_id)
-    history = json.loads(data).get("history", []) if data else []
+    history = get_history(session_id)
     history.append({"user": question, "assistant": answer})
-    rdb.set(session_id, json.dumps({"history": history}))
+    save_history(session_id, history)
 
     return answer
+
 
 def retrival_node(state: RAGstate) -> RAGstate:
     results = search_index(state["question"], top_k=3)
@@ -140,7 +133,7 @@ You are a clinical assistant.
 IMPORTANT RULES:
 - ONLY use the provided context to answer.
 - If the context does not contain enough information, respond with exactly: "I don't know based on the available context."
-- If you do not have enough information to answer from the context you may reffer to the PubMed results if given below if availale.
+- If you do not have enough information to answer from the context you may reffer to the PubMed results  given below if availale.
 - Do NOT use your own general knowledge.
 - Do NOT invent answers.
 
@@ -361,15 +354,14 @@ def query_doc():
     data = request.get_json()
     question = data.get("question", "").strip()
     session_id = data.get("session_id")
+
     if not session_id or not question:
         return jsonify({"error": "session_id & question needed"}), 400
 
     history = get_history(session_id)
     history_text = "\n".join([f"User: {h['user']}\nAssistant: {h['assistant']}" for h in history])
 
-    job_id = str(uuid.uuid4())
-    task = run_query_task.delay(job_id, question, history_text, session_id)
-    answer = task.get(timeout=60)
+    answer = run_query_task(question, history_text, session_id)
 
     history = get_history(session_id)
     return jsonify({"answer": answer, "history_length": len(history)})
@@ -377,3 +369,7 @@ def query_doc():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=True)
+
+
+
+
