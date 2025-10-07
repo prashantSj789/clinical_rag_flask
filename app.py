@@ -5,16 +5,20 @@ import uuid
 from celery import Celery
 from flask import Flask, request, jsonify
 from PyPDF2 import PdfReader
-
+from IPython.display import Image, display
 import docx
 from flask.cli import load_dotenv
 import redis 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph,END,START
-
+from flask import Response
 from vector_store_to_chroma import add_project_docs, add_to_index, search_index, search_project_docs
 from Bio import Entrez
 from typing_extensions import TypedDict
+from langchain_core.runnables.graph import MermaidDrawMethod
+
+
+
 
 app = Flask(__name__)
 
@@ -366,6 +370,13 @@ def query_doc():
     history = get_history(session_id)
     return jsonify({"answer": answer, "history_length": len(history)})
 
+
+
+@app.route("/graph", methods=["GET"])
+def graph_png():
+    png_bytes = rag_app.get_graph().draw_mermaid_png(draw_method=MermaidDrawMethod.API)
+    display(Image(png_bytes))
+    return Response(png_bytes, mimetype="image/png")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=True)
