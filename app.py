@@ -100,10 +100,13 @@ INSTRUCTIONS:
 - If the question is about the **app or developer** but the CONTEXT is insufficient, reply exactly with: "AboutQuery".  
 - Do NOT use your own general knowledge. Do NOT hallucinate.
 """
+      
     resp = llm.invoke(prompt)
     text = resp.strip() if isinstance(resp, str) else getattr(resp, "content", "").strip()
+    print("[DECIDER] LLM decision output:", repr(text))
 
     if text == "NEED_PUBMED":
+        print("[DECIDER] → Routing to PubMed")
         return {"pubmed_results": "NEED"}
     elif text == "AboutQuery":
         return {"aboutquery": "NEED"}
@@ -114,16 +117,60 @@ INSTRUCTIONS:
     
 
 def pubmed_node(state: RAGstate) -> RAGstate:
+    print("\n[PUBMED NODE] Entered")
+    print("[PUBMED NODE] pubmed_results flag:", state.get("pubmed_results"))
+
     if state.get("pubmed_results") != "NEED":
-        return {}
-    results = pubmed_search(state["question"], max_results=3)
-    return {"pubmed_results": results or ""}   
+        print("[PUBMED NODE] Skipped (flag not NEED)")
+        return state
+
+    # 🔹 REWRITE HAPPENS HERE
+    rewritten_query = pubmed_query_rewrite(state["question"])
+    print("[PUBMED NODE] Rewritten PubMed query:", rewritten_query)
+
+    print("[PUBMED NODE] Calling pubmed_search()")
+    results = pubmed_search(rewritten_query, max_results=3)
+
+    print("[PUBMED NODE] Results received:", bool(results))
+    if results:
+        print("[PUBMED NODE] Results length:", len(results))
+    else:
+        print("[PUBMED NODE] WARNING: PubMed returned EMPTY results")
+
+    return {
+        **state,
+        "pubmed_results": results or ""
+    }
+
 
 def doc_node(state: RAGstate) -> RAGstate:
     if state.get("aboutquery") != "NEED":
         return {}
     results = retrival_node2(state)
     return {"context": results.get("context","")}
+
+def pubmed_query_rewrite(question: str) -> str:
+    prompt = f"""
+Convert the following clinical question into a concise PubMed search query.
+Return ONLY keywords, no sentences.
+
+Question:
+{question}
+"""
+    resp = llm.invoke(prompt)
+    return resp.content.strip()
+
+
+def debug_pubmed_node(state: RAGstate) -> RAGstate:
+    print("\n[DEBUG NODE] ===== PubMed Debug =====")
+    print("[DEBUG NODE] pubmed_results type:", type(state.get("pubmed_results")))
+    print("[DEBUG NODE] pubmed_results length:",
+          len(state.get("pubmed_results", "")) if isinstance(state.get("pubmed_results"), str) else "N/A")
+    print("[DEBUG NODE] pubmed_results content:\n",
+          state.get("pubmed_results")[:1000] if state.get("pubmed_results") else "EMPTY")
+    print("[DEBUG NODE] =========================\n")
+    return state  # IMPORTANT: return full state unchanged
+
 
 
 
@@ -135,9 +182,11 @@ def answer_node(state: RAGstate) -> RAGstate:
     prompt = f"""
 You are a clinical assistant. 
 IMPORTANT RULES:
-- ONLY use the provided context to answer.
+- Use the provided context to infer and summarize an answer.
+- You may draw reasonable conclusions strictly supported by the context.
 - If the context does not contain enough information, respond with exactly: "I don't know based on the available context."
 - If you do not have enough information to answer from the context you may reffer to the PubMed results  given below if availale.
+- Analyze the CONTEXT and PUBMED RESULTS carefully before answering.
 - Do NOT use your own general knowledge.
 - Do NOT invent answers.
 
@@ -165,6 +214,7 @@ graph.add_node("decider", decision_node)
 graph.add_node("pubmed", pubmed_node)
 graph.add_node("answer", answer_node)
 graph.add_node("docretrieval", doc_node)
+graph.add_node("debug_pubmed", debug_pubmed_node)
 # flow
 graph.add_edge(START, "retrieval")
 graph.add_edge("retrieval", "decider")
@@ -184,7 +234,8 @@ graph.add_conditional_edges(
     {"pubmed": "pubmed", "docretrieval": "docretrieval", "answer": "answer"}
 )
 
-graph.add_edge("pubmed", "answer")
+graph.add_edge("pubmed", "debug_pubmed")
+graph.add_edge("debug_pubmed", "answer")
 graph.add_edge("docretrieval", "answer")
 graph.add_edge("answer", END)
 
@@ -237,6 +288,7 @@ def pubmed_search(query, max_results=3):
         handle2.close()
 
         results = []
+        print(fetch_data)
         for article in fetch_data.get("PubmedArticle", []):
             # Extract title, abstract
             try:
@@ -363,8 +415,9 @@ def query_doc():
         return jsonify({"error": "session_id & question needed"}), 400
 
     history = get_history(session_id)
+    print("[QUERY] Retrieved history length:", history)
     history_text = "\n".join([f"User: {h['user']}\nAssistant: {h['assistant']}" for h in history])
-
+    print("[QUERY] History length:", len(history))
     answer = run_query_task(question, history_text, session_id)
 
     history = get_history(session_id)
